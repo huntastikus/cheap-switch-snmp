@@ -1,29 +1,45 @@
-# Use a minimal base image for the final image
-FROM golang:1.23-alpine AS build
+FROM golang:1.21-alpine AS builder
 
-# Set the working directory inside the container
+# Install build dependencies
+RUN apk add --no-cache gcc musl-dev
+
+# Set working directory
 WORKDIR /app
 
-# Copy the Go module files to the working directory
+# Copy go mod files
 COPY go.mod go.sum ./
 
-# Download the Go module dependencies
+# Download dependencies
 RUN go mod download
 
-# Copy the rest of the application source code
+# Copy source code
 COPY . .
 
-# Build the Go application
-RUN CGO_ENABLED=0 go build -o cheap-switch-snmp
+# Build the application
+RUN CGO_ENABLED=0 GOOS=linux go build -o cheap-switch-snmp
 
-# Use a minimal base image for the final image
-FROM scratch
+# Final stage
+FROM alpine:3.18
 
-# Copy the built binary from the previous stage
-COPY --from=build /app/cheap-switch-exporter /cheap-switch-exporter
+# Install runtime dependencies for SNMP
+RUN apk add --no-cache ca-certificates net-snmp
 
-# Expose port 8080
-EXPOSE 8080
+# Create non-root user
+RUN adduser -D appuser
 
-# Set the entrypoint command for the Docker container
-ENTRYPOINT ["/cheap-switch-snmp"]
+# Copy the binary from builder
+COPY --from=builder /app/cheap-switch-snmp /cheap-switch-snmp
+
+# Copy config file
+COPY config.yaml /config.yaml
+
+RUN chown appuser:appuser /config.yaml /cheap-switch-snmp
+
+# Set user
+USER appuser
+
+# Expose SNMP port (default UDP 161)
+EXPOSE 161/udp
+
+# Run the application
+ENTRYPOINT ["./cheap-switch-snmp"]
