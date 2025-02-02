@@ -24,19 +24,8 @@ FROM alpine:3.18
 # Install runtime dependencies for SNMP
 RUN apk add --no-cache ca-certificates net-snmp
 
-# Create non-root user
-RUN adduser -D appuser
-
 # Copy the binary from builder
 COPY --from=builder /app/cheap-switch-snmp /cheap-switch-snmp
-
-# Copy config file
-COPY config.yaml /config.yaml
-
-RUN chown appuser:appuser /config.yaml /cheap-switch-snmp
-
-# Set user
-USER appuser
 
 # Expose SNMP port (default UDP 161)
 EXPOSE 161/udp
