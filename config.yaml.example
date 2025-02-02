@@ -1,4 +1,15 @@
----
-address: 192.168.2.1
-username: admin
-password: admin
+snmp_port: 161
+snmp_community: "public"
+switches:
+  - address: "192.168.1.100"
+    username: "admin"
+    password: "password123"
+    name: "core-switch-1"
+  - address: "192.168.1.101"
+    username: "admin"
+    password: "password123"
+    name: "access-switch-2"
+  - address: "192.168.1.102"
+    username: "admin"
+    password: "password123"
+    name: "edge-switch-3"

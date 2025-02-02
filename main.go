@@ -6,227 +6,179 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
-	"strconv"
-	"strings"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/shirou/gopsutil/host"
+	"github.com/soniah/gosnmp"
 	"gopkg.in/yaml.v3"
 )
 
-type Config struct {
+type Switch struct {
 	Address  string `yaml:"address"`
 	Username string `yaml:"username"`
 	Password string `yaml:"password"`
+	Name     string `yaml:"name"`
+}
+
+type Config struct {
+	Switches      []Switch `yaml:"switches"`
+	SNMPPort      uint16   `yaml:"snmp_port"`
+	SNMPCommunity string   `yaml:"snmp_community"`
 }
 
 type Port struct {
-	Name       string `json:"port"`
-	State      string `json:"state"`
-	LinkStatus string `json:"link_status"`
-	TxGoodPkt  int    `json:"tx_good_pkt"`
-	TxBadPkt   int    `json:"tx_bad_pkt"`
-	RxGoodPkt  int    `json:"rx_good_pkt"`
-	RxBadPkt   int    `json:"rx_bad_pkt"`
+	Name       string
+	State      string
+	LinkStatus string
+	TxGoodPkt  int
+	TxBadPkt   int
+	RxGoodPkt  int
+	RxBadPkt   int
 }
 
-type PortStatistics struct {
-	Ports []Port `json:"port_statistics"`
-}
+const (
+	baseOID       = ".1.3.6.1.4.1.12345"
+	portStateOID  = baseOID + ".1"
+	linkStateOID  = baseOID + ".2"
+	txGoodPktOID  = baseOID + ".3"
+	txBadPktOID   = baseOID + ".4"
+	rxGoodPktOID  = baseOID + ".5"
+	rxBadPktOID   = baseOID + ".6"
+)
+
+var (
+	portStats = make(map[string]map[string]Port)
+	statsMux  sync.RWMutex
+)
 
 func main() {
-
-	// Read config.json
 	config, err := readConfig("config.yaml")
 	if err != nil {
 		log.Fatal("Error reading configuration:", err)
 	}
 
-	// Check if required fields are provided in the configuration file
-	if config.Address == "" || config.Username == "" || config.Password == "" {
-		log.Fatal("Missing required fields in the configuration file.")
+	for _, sw := range config.Switches {
+		portStats[sw.Name] = make(map[string]Port)
 	}
 
-	// Set the base URL
-	baseURL := "http://" + config.Address + "/port.cgi?page=stats"
+	for _, sw := range config.Switches {
+		go collectSwitchStats(sw)
+	}
 
-	// Set the URL parameters
-	params := url.Values{}
-	params.Set("page", "stats")
+	snmp := &gosnmp.GoSNMP{
+		Port:      config.SNMPPort,
+		Community: config.SNMPCommunity,
+		Version:   gosnmp.Version2c,
+		Timeout:   time.Duration(2) * time.Second,
+	}
 
-	// Set the form parameters
-	formParams := url.Values{}
-	username := config.Username
-	password := config.Password
-	formParams.Set("username", username)
-	formParams.Set("password", password)
-	formParams.Set("language", "EN")
-	formParams.Set("Response", getMD5Hash(username+password))
+	log.Printf("Starting SNMP agent on port %d", config.SNMPPort)
+	err = snmp.Listen()
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	// Create a new HTTP client
+	snmp.Handler = snmpHandler
+
+	select {}
+}
+
+func collectSwitchStats(sw Switch) {
 	client := &http.Client{}
-
-	// Create Prometheus metrics
-	portState := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "port_state",
-		Help: "State of the port",
-	}, []string{"port"})
-	portLinkStatus := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "port_link_status",
-		Help: "Link status of the port",
-	}, []string{"port"})
-	portTxGoodPkt := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "port_tx_good_pkt",
-		Help: "Number of good packets transmitted on the port",
-	}, []string{"port"})
-	portTxBadPkt := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "port_tx_bad_pkt",
-		Help: "Number of bad packets transmitted on the port",
-	}, []string{"port"})
-	portRxGoodPkt := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "port_rx_good_pkt",
-		Help: "Number of good packets received on the port",
-	}, []string{"port"})
-	portRxBadPkt := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "port_rx_bad_pkt",
-		Help: "Number of bad packets received on the port",
-	}, []string{"port"})
-
-	// Expose our metrics with a custom registry
-	r := prometheus.NewRegistry()
-	handler := promhttp.HandlerFor(r, promhttp.HandlerOpts{})
-
-	// Register Prometheus metrics
-	r.MustRegister(portState)
-	r.MustRegister(portLinkStatus)
-	r.MustRegister(portTxGoodPkt)
-	r.MustRegister(portTxBadPkt)
-	r.MustRegister(portRxGoodPkt)
-	r.MustRegister(portRxBadPkt)
-
-	// Start the Prometheus exporter endpoint
-	http.Handle("/metrics", handler)
-	fmt.Println("Starting Prometheus exporter on :8080/metrics")
-	go func() {
-		log.Fatal(http.ListenAndServe(":8080", nil))
-	}()
-
-	// Start updating the values every second
-	ticker := time.NewTicker(1 * time.Second)
+	baseURL := "http://" + sw.Address + "/port.cgi?page=stats"
+	
+	ticker := time.NewTicker(30 * time.Second)
 	for range ticker.C {
-		// Create a new GET request with the parameters
-		req, err := http.NewRequest("GET", baseURL, strings.NewReader(formParams.Encode()))
+		stats, err := fetchSwitchStats(client, sw, baseURL)
 		if err != nil {
-			log.Println("Error creating request:", err)
+			log.Printf("Error collecting stats from %s (%s): %v", sw.Name, sw.Address, err)
 			continue
 		}
 
-		// Set the cookie header
-		cookieValue := getMD5Hash(username + password)
-		cookie := &http.Cookie{Name: "admin", Value: cookieValue}
-		req.AddCookie(cookie)
-
-		// Set the Content-Type header
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-		// Set the request parameters
-		req.URL.RawQuery = params.Encode()
-
-		// Send the request
-		resp, err := client.Do(req)
-		if err != nil {
-			log.Println("Error sending request:", err)
-			continue
-		}
-
-		// Load the HTML document
-		doc, err := goquery.NewDocumentFromReader(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			log.Println("Error loading HTML document:", err)
-			continue
-		}
-
-		var stats PortStatistics
-
-		doc.Find("table tr").Each(func(i int, s *goquery.Selection) {
-			if i != 0 {
-				port := Port{}
-				s.Find("td").Each(func(j int, td *goquery.Selection) {
-					switch j {
-					case 0:
-						port.Name = td.Text()
-					case 1:
-						port.State = td.Text()
-					case 2:
-						port.LinkStatus = td.Text()
-					case 3:
-						port.TxGoodPkt, _ = strconv.Atoi(strings.TrimSpace(td.Text()))
-					case 4:
-						port.TxBadPkt, _ = strconv.Atoi(strings.TrimSpace(td.Text()))
-					case 5:
-						port.RxGoodPkt, _ = strconv.Atoi(strings.TrimSpace(td.Text()))
-					case 6:
-						port.RxBadPkt, _ = strconv.Atoi(strings.TrimSpace(td.Text()))
-					}
-				})
-				stats.Ports = append(stats.Ports, port)
-			}
-		})
-
-		// Update Prometheus metrics
-		for _, port := range stats.Ports {
-			portState.WithLabelValues(port.Name).Set(stateToFloat(port.State))
-			portLinkStatus.WithLabelValues(port.Name).Set(linkStatusToFloat(port.LinkStatus))
-			portTxGoodPkt.WithLabelValues(port.Name).Set(float64(port.TxGoodPkt))
-			portTxBadPkt.WithLabelValues(port.Name).Set(float64(port.TxBadPkt))
-			portRxGoodPkt.WithLabelValues(port.Name).Set(float64(port.RxGoodPkt))
-			portRxBadPkt.WithLabelValues(port.Name).Set(float64(port.RxBadPkt))
-		}
+		statsMux.Lock()
+		portStats[sw.Name] = stats
+		statsMux.Unlock()
 	}
 }
 
-// Helper function to convert port state to float
-func stateToFloat(state string) float64 {
+func snmpHandler(packet *gosnmp.SnmpPacket) (*gosnmp.SnmpPacket, error) {
+	response := &gosnmp.SnmpPacket{
+		Variables: []gosnmp.SnmpPDU{},
+	}
+
+	statsMux.RLock()
+	defer statsMux.RUnlock()
+
+	for switchName, ports := range portStats {
+		for portName, port := range ports {
+			oid := fmt.Sprintf("%s.%s.%s", baseOID, switchName, portName)
+			
+			response.Variables = append(response.Variables,
+				gosnmp.SnmpPDU{
+					Name:  oid + ".state",
+					Type:  gosnmp.Integer,
+					Value: stateToInt(port.State),
+				},
+				gosnmp.SnmpPDU{
+					Name:  oid + ".linkStatus",
+					Type:  gosnmp.Integer,
+					Value: linkStatusToInt(port.LinkStatus),
+				},
+				gosnmp.SnmpPDU{
+					Name:  oid + ".txGoodPkt",
+					Type:  gosnmp.Counter64,
+					Value: uint64(port.TxGoodPkt),
+				},
+				gosnmp.SnmpPDU{
+					Name:  oid + ".txBadPkt",
+					Type:  gosnmp.Counter64,
+					Value: uint64(port.TxBadPkt),
+				},
+				gosnmp.SnmpPDU{
+					Name:  oid + ".rxGoodPkt",
+					Type:  gosnmp.Counter64,
+					Value: uint64(port.RxGoodPkt),
+				},
+				gosnmp.SnmpPDU{
+					Name:  oid + ".rxBadPkt",
+					Type:  gosnmp.Counter64,
+					Value: uint64(port.RxBadPkt),
+				},
+			)
+		}
+	}
+
+	return response, nil
+}
+
+func stateToInt(state string) int {
 	if state == "Enable" {
 		return 1
 	}
 	return 0
 }
 
-// Helper function to convert link status to float
-func linkStatusToFloat(status string) float64 {
+func linkStatusToInt(status string) int {
 	if status == "Link Up" {
 		return 1
 	}
 	return 0
 }
 
-// Helper function to calculate MD5 hash
 func getMD5Hash(text string) string {
 	hash := md5.Sum([]byte(text))
 	return hex.EncodeToString(hash[:])
 }
 
-// Helper function to read config file
 func readConfig(filename string) (Config, error) {
 	var config Config
-
-	// Read the configuration file
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		return config, err
 	}
-
-	// Unmarshal the YAML data into the Config struct
 	err = yaml.Unmarshal(data, &config)
-	if err != nil {
-		return config, err
-	}
-
-	return config, nil
+	return config, err
 }

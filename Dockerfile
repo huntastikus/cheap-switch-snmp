@@ -1,5 +1,5 @@
 # Use a minimal base image for the final image
-FROM golang:1.21-alpine AS build
+FROM golang:1.23-alpine AS build
 
 # Set the working directory inside the container
 WORKDIR /app
@@ -14,7 +14,7 @@ RUN go mod download
 COPY . .
 
 # Build the Go application
-RUN CGO_ENABLED=0 go build -o cheap-switch-exporter
+RUN CGO_ENABLED=0 go build -o cheap-switch-snmp
 
 # Use a minimal base image for the final image
 FROM scratch
@@ -26,4 +26,4 @@ COPY --from=build /app/cheap-switch-exporter /cheap-switch-exporter
 EXPOSE 8080
 
 # Set the entrypoint command for the Docker container
-ENTRYPOINT ["/cheap-switch-exporter"]
+ENTRYPOINT ["/cheap-switch-snmp"]
